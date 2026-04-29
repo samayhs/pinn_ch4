@@ -1,0 +1,457 @@
+================================================================================
+  PINN for Methane/Air Combustion Chemistry — Project Documentation
+================================================================================
+
+Author:  Samay Shah
+Project: pinn_ch4/
+
+This document traces the full development arc of a Physics-Informed Neural
+Network (PINN) for learning constant-pressure methane/air combustion chemistry,
+trained against Cantera reference simulations using the FFCM-2 mechanism.
+
+
+================================================================================
+  1.  PROJECT OVERVIEW
+================================================================================
+
+Goal
+----
+Replace the stiff ODE integration step of a detailed chemical kinetics
+mechanism (FFCM-2, methane/air) with a neural network that:
+
+  - Maps a thermochemical state at time t to the state at time t + dt.
+  - Respects physical conservation laws (enthalpy, atoms, mole fractions).
+  - Embeds analytical thermodynamic and kinetic calculations (NASA-7
+    polynomials, Arrhenius rates) directly into the model as differentiable
+    PyTorch operations.
+
+The network is supervised against Cantera trajectories and additionally
+constrained by physics-informed loss terms derived from the governing ODEs
+for a constant-pressure reactor:
+
+    dT/dt  = -(1 / (rho * cp)) * sum_k( h_k * omega_k )
+    dYk/dt = omega_k * Wk / rho          (mass-fraction form)
+    dXk/dt = (1/c) * d[Xk]/dt + ...      (mole-fraction form)
+
+
+Mechanisms Used
+---------------
+  mechanisms/FFCM2.yaml      Full FFCM-2 mechanism (all species)
+  mechanisms/FFCM2_26.yaml   Reduced 26-species subset of FFCM-2
+
+
+================================================================================
+  2.  DEVELOPMENT TIMELINE / EVOLUTION
+================================================================================
+
+Phase 1 — MethanePinn2 (Proof of Concept)
+------------------------------------------
+File: scripts/helpers/methane_pinn2.py
+
+A minimal first attempt. A plain 3-layer MLP (128 hidden units, ReLU) that
+takes the full state vector [T, P, X_1..X_K] and predicts the next state
+directly. The loss function (loss_fn) runs a single Cantera reactor step
+inline to get the ground truth, then computes MSE between the model output
+and the Cantera result.
+
+  Input:  [T, P, X_1, ..., X_K]   (n_species + 2 values)
+  Output: [T, P, X_1, ..., X_K]   (same shape)
+  Loss:   MSE(predicted_state, cantera_advanced_state)
+
+Limitations that motivated the next iteration:
+  - No physics constraints; purely data-driven.
+  - Cantera is called inside the loss function (slow, not batched).
+  - No normalization of inputs/outputs.
+  - No dt as an input — fixed at 1e-4 s.
+
+A simple test harness exists in scripts/test_methane_pinn2.py that runs
+1000 Adam steps on a single initial condition.
+
+
+Phase 2 — StateNet1 (SolutionNet + ChemNet Architecture)
+---------------------------------------------------------
+File: scripts/helpers/StateNet1.py
+File: scripts/StateNet1_train.py
+
+Major rework introducing two distinct sub-networks and analytical
+thermodynamics:
+
+  SolutionNet:  t -> [T, Y_1, ..., Y_K]
+    - Maps a scalar time input to the full thermochemical state.
+    - 5-layer MLP with Tanh activations.
+    - Hard IC enforcement via output transform: y(t) = y0 + t * NN(t),
+      which guarantees y(0) = y0 exactly.
+
+  ChemNet:  [T, P, Y_1..Y_K, dt] -> [omega_1, ..., omega_K]
+    - Learns net molar production rates from the thermochemical state.
+    - 4-layer MLP (128 hidden, LayerNorm + Tanh).
+
+  StateNet (the combined model):
+    - Wraps ChemNet inside a residual state predictor.
+    - state0 -> state0 + MLP(state0)
+    - Embeds NASA-7 polynomial coefficients as registered buffers for
+      differentiable cp(T,Y) and hk(T) computation in PyTorch.
+    - Input state: [T, P, Y_1..Y_K, dt]
+
+Analytical Thermodynamics (NASA-7 Polynomials):
+    cp_k/R  = a1 + a2*T + a3*T^2 + a4*T^3 + a5*T^4
+    hk/(RT) = a1 + a2*T/2 + a3*T^2/3 + a4*T^3/4 + a5*T^4/5 + a6/T
+
+    - Coefficients are split into low/high temperature ranges with T_mid
+      switching, implemented via torch.where for differentiability.
+    - cp() returns mass-based mixture cp in J/(kg*K).
+    - hk() returns per-species molar enthalpies in J/kmol.
+
+Training (StateNet1_train.py):
+    - Cantera simulations are run offline over a grid of conditions:
+        T  in {1500, 1600, 1700} K
+        P  in {1} atm
+        phi in {0.7, 1.0, 1.3}
+    - The training data consists of [T, P, Y_1..Y_K, dt] state vectors
+      paired with Cantera net_production_rates (omega) as targets.
+    - Results are cached as CSVs to avoid re-running Cantera.
+    - The loss function (loss_fn in StateNet1.py) combines:
+        1. Species ODE residual:  MSE( dYk/dt_predicted, omega*Wk/rho * dt )
+        2. Energy ODE residual:   MSE( dT/dt_predicted, -(h*omega)/(rho*cp) * dt )
+        3. Pressure consistency:  MSE( P_predicted, P_input )
+        4. dt consistency:        penalty if dt deviates from 1e-6
+        5. Omega data loss:       MSE( omega_predicted, omega_cantera )
+    - Density rho is computed from the ideal gas law: rho = P*W_mix/(R*T).
+    - Adam optimizer with gradient clipping (max_norm=1.0).
+    - Batch size 64, random sampling from concatenated trajectories.
+
+Evaluation (in StateNet1_train.py):
+    - Autoregressive rollout: start from an initial condition, feed the
+      model's own output back as input for n_steps.
+    - Compare predicted temperature trajectory vs Cantera reference.
+
+Validation utilities:
+    - validate_model_hk(): Plots hk(T) from the model vs Cantera for
+      the first 6 species across a temperature range.
+
+
+Phase 3 — StateNet2 (Current Architecture)
+-------------------------------------------
+File: scripts/helpers/StateNet2.py
+File: scripts/helpers/train_StateNet2.py
+File: scripts/helpers/lossfn.py
+File: scripts/main.py
+
+The current and most developed iteration. Key changes from StateNet1:
+
+  a) Mole fractions (X) instead of mass fractions (Y)
+     - State vector: [T, P, X_1..X_K, t, t_end]
+     - The time input is now (t, t_end) where t_end = 5 * IDT. The ratio
+       t/t_end is used as a normalized progress variable.
+
+  b) Input/output normalization
+     - T is z-scored: T' = (T - mu_T) / sigma_T
+     - P is log-z-scored: P' = (ln(P) - mu_lnP) / sigma_lnP
+     - Species are log-z-scored: X'_k = (ln(X_k) - mu_lnX_k) / sigma_lnX_k
+     - Time is ratio-normalized: dt' = (t/t_end - mu_t_norm) / sigma_t_norm
+     - Statistics are computed from training data (generate_reference_data)
+       and stored as registered buffers.
+     - Separate normalize(), denormalize(), and renormalize() methods.
+
+  c) ELU activations instead of Tanh (no LayerNorm in this version)
+
+  d) Full analytical Arrhenius kinetics embedded in PyTorch
+     The compute_arrhenius(T, X, P) method handles all reaction types found
+     in FFCM-2:
+
+     Elementary reactions:
+       k_f = A * T^b * exp(-Ea / (R*T))
+
+     Three-body reactions:
+       k_f *= [M]   where [M] = sum(eff_k * [X_k]) is the third-body
+       concentration with per-species efficiency factors.
+
+     Falloff reactions (Lindemann, Troe, SRI):
+       k_0 = A_0 * T^b_0 * exp(-Ea_0 / (R*T))     (low-pressure limit)
+       k_inf = A * T^b * exp(-Ea / (R*T))           (high-pressure limit)
+       Pr = k_0 * [M] / k_inf                       (reduced pressure)
+       k_eff = k_inf * Pr/(1+Pr) * F                (effective rate)
+
+       Troe blending (F_cent formulation):
+         F_cent = (1-A)*exp(-T/T3) + A*exp(-T/T1) + exp(-T2/T)
+         log(F) = log(F_cent) / (1 + f1^2)
+         where f1 = (log(Pr) + c) / (n - d*(log(Pr) + c))
+
+       SRI blending:
+         F = d * [a*exp(-b/T) + exp(-T/c)]^X * T^e
+         where X = 1 / (1 + log10(Pr)^2)
+
+     Pressure-dependent Arrhenius (PLog):
+       - Tabulated (P, A, b, Ea) points per reaction.
+       - Log-pressure interpolation between bracketing pressure points.
+       - Padded arrays with plog_n_pts tracking valid entries.
+
+     Reverse rates via equilibrium:
+       - Entropy sk(T) computed from NASA-7: S/R = a1*ln(T) + a2*T + ...
+       - Gibbs: g/RT = h/RT - S/R
+       - K_p = exp(-delta_g/RT), K_c = K_p * (P_atm/(RT))^(-sum_nu)
+       - k_r = k_f / K_c
+
+     All reaction parameters (A, b, Ea, efficiency matrices, Troe/SRI
+     coefficients, PLog tables, stoichiometric matrices) are extracted from
+     the Cantera gas object at construction time and stored as registered
+     buffers. Log(A) values are precomputed for numerical stability.
+
+  e) Stoichiometric matrices
+     - nu_prime (I, K): reactant stoichiometric coefficients
+     - nu_double_prime (I, K): product stoichiometric coefficients
+     - Extracted from gas.reactant_stoich_coeffs / product_stoich_coeffs
+       with compatibility handling for both Cantera 2.x and 3.x APIs.
+
+  f) Atom conservation matrix
+     - atom_matrix (K, E): number of atoms of each element in each species.
+     - Used in the atom conservation loss term.
+
+
+================================================================================
+  3.  LOSS FUNCTIONS (lossfn.py)
+================================================================================
+
+The combined loss (loss_fn2) aggregates five terms with manual weighting:
+
+  total = 1e-8 * l_dx
+        + 1e-9 * l_enthalpy
+        + 1e5  * l_atom
+        + 1e2  * l_mole
+        + 1e4  * l_data
+
+Individual terms:
+
+  1. ODE Residual (ode_loss_v2 — "dx" in logs)
+     Compares dX/dt from autograd (through the normalized network) against
+     dX/dt from analytical mass-action kinetics:
+
+       dX_k/dt_chem = (1/c) * d[X_k]/dt + ([X_k]/(c*T)) * dT/dt
+
+     where d[X_k]/dt comes from rate_per_rxn @ (nu'' - nu').
+     Autograd derivatives are taken w.r.t. the last column of the
+     normalized input (the time coordinate).
+
+     An earlier version (ode_loss, commented out) worked in log-normalized
+     space but suffered from 1/X blowup for trace species.
+
+  2. Enthalpy Conservation (enthalpy_loss — "enthalpy")
+     Enforces h_mix(state_0) == h_mix(state_1) across the time step.
+     h_mix = sum(Y_k * h_k / W_k) with Y_k derived from X_k.
+
+  3. Atom Conservation (atom_conservation_loss — "atom")
+     Enforces sum(a_{e,k} * X_k) / W_mix = const for each element e.
+     Uses the atom_matrix buffer.
+
+  4. Mole Fraction Normalization (mole_fraction_loss — "mole")
+     Enforces sum(X_k) = 1 for the predicted output.
+
+  5. Data Loss (data_loss — "data")
+     Supervised MSE in normalized space between the model's normalized
+     output and the renormalized Cantera target state. This is the primary
+     learning signal; the physics losses act as regularizers.
+
+
+================================================================================
+  4.  DATA GENERATION & TRAINING PIPELINE
+================================================================================
+
+Data Generation (train_StateNet2.py: generate_training_data)
+------------------------------------------------------------
+  - Grid of initial conditions:
+      T   in {1500, 1600, 1700} K  (configurable)
+      P   in {1} atm               (configurable)
+      phi in {0.7, 1.0, 1.3}       (configurable)
+
+  - For each (T, P, phi):
+      1. Run Cantera constant-pressure reactor.
+      2. Determine IDT as time of peak H radical mass fraction.
+      3. Re-run with t_end = 5 * IDT to capture the full ignition event
+         and post-flame relaxation, with ~1000 time steps.
+      4. Save state array as CSV: [T, P, X_1..X_K, t, t_end] per row.
+      5. Cache to results/26/ directory; skip re-running if CSV exists.
+
+  - Reference statistics (generate_reference_data):
+      Concatenate all trajectory rows and compute (mu, sigma) for T,
+      ln(P), ln(X_k), and t/t_end. These are passed to StateNet2 at
+      construction for normalization.
+
+Dataset (TrajectoryPairDataset)
+-------------------------------
+  - Loads all trajectory CSVs from a directory.
+  - Each __getitem__ picks a random trajectory, then two random rows
+    (i < j) to form a (state_t, state_t+dt) pair.
+  - The dt and t_end are computed on the fly from the row timestamps.
+  - Virtual dataset size: n_trajectories * 1000.
+
+Training Loop (train)
+---------------------
+  - DataLoader with batch_size=250, shuffle=True.
+  - Adam optimizer with configurable learning rate (default 1e-4).
+  - Gradient clipping: max_norm=1.0.
+  - Per-epoch: iterate over all batches, accumulate per-term losses,
+    print colored diagnostics every 10 epochs (with arrows showing
+    per-term improvement/regression).
+  - Monitors normalized output statistics (mean/std of T', P', X')
+    as a sanity check for network collapse.
+  - Saves model state_dict to disk.
+  - Plots per-term loss history on semilogy axes.
+
+
+================================================================================
+  5.  EVALUATION PIPELINE
+================================================================================
+
+evaluate() in train_StateNet2.py
+--------------------------------
+For each trajectory CSV:
+
+  1. Single-step evaluation:
+     - Sample up to 1000 random (i, j) pairs from the trajectory.
+     - Construct input [T, P, X, dt, t_end] from row i, target from row j.
+     - Compute MSE for T, P, and X separately.
+     - Report input vs output T standard deviation as a diagnostic for
+       whether the model is actually responding to varied inputs.
+
+  2. Autoregressive rollout:
+     - Start from t=0 state, feed model its own output for up to
+       n_rollout_steps (default 200).
+     - Use the true dt spacing from the reference trajectory (oracle).
+     - Compute rollout MSE for T, P, X.
+     - Peak-T error: absolute and relative error in maximum temperature.
+     - Time-of-peak-T error: proxy for trajectory phase alignment.
+
+  3. Plotting:
+     - Per-condition rollout plot: temperature + select species
+       (OH, CH4, CO2, H2O, O2) on semilogy axes.
+     - Saved to results/eval/rollout_*.png.
+
+  4. Summary CSV (results/eval/eval_summary.csv):
+     - One row per condition with all metrics.
+
+
+================================================================================
+  6.  VALIDATION UTILITIES
+================================================================================
+
+These functions (in train_StateNet2.py) verify that the analytical
+thermodynamic and kinetic methods embedded in StateNet2 match Cantera
+before any training occurs:
+
+  validate_model_hk(gas, T):
+    Plots per-species molar enthalpy hk(T) [MJ/kmol] from the model's
+    NASA-7 implementation vs Cantera's standard_enthalpies_RT * R * T.
+    Saved to results/validate_hk.png.
+
+  validate_model_sk(gas, T):
+    Plots per-species dimensionless entropy Sk/R from the model's NASA-7
+    implementation vs Cantera's standard_entropies_R.
+    Saved to results/validate_sk.png.
+
+  validate_model_arrhenius(gas, T):
+    Plots forward rate constants kf for the first 6 reactions across a
+    temperature range, comparing model.compute_arrhenius() vs Cantera's
+    forward_rate_constants.
+    Saved to results/validate_kf.png.
+
+
+================================================================================
+  7.  AUXILIARY COMPONENTS
+================================================================================
+
+IDTNet (scripts/helpers/IDTNet.py)
+----------------------------------
+A small standalone MLP that predicts ignition delay time (IDT) from
+initial conditions (T0, P, phi). Not integrated into the main training
+pipeline — appears to be an exploratory side component.
+
+  Input:  [ln(P), T0, phi]
+  Output: exp(MLP output) — IDT in seconds
+  Loss:   combined log-space + relative MSE
+
+ct_runs.py (scripts/helpers/ct_runs.py)
+---------------------------------------
+Helper utilities:
+  - get_states(): Run Cantera and save state CSV (same logic as
+    generate_training_data but for individual conditions).
+  - plot_csv(): Quick plot of T vs t from trajectory CSVs.
+
+run_one_step_cantera.py
+-----------------------
+A standalone scratch script computing a single forward rate constant for
+H + O2 <=> O + OH using hardcoded Arrhenius parameters. Not connected to
+the main pipeline.
+
+
+================================================================================
+  8.  FILE STRUCTURE
+================================================================================
+
+pinn_ch4/
+  main.py                          Entry point (currently uses FFCM2_26)
+  run_one_step_cantera.py          Standalone rate constant calculation
+  mechanisms/
+    FFCM2.yaml                     Full FFCM-2 mechanism
+    FFCM2_26.yaml                  Reduced 26-species mechanism
+  scripts/
+    main.py                        Entry point (calls train + evaluate)
+    test_methane_pinn2.py          Early test harness for MethanePinn2
+    StateNet1_train.py             Training script for StateNet1 (legacy)
+    helpers/
+      methane_pinn2.py             Phase 1: MethanePinn2 model + loss
+      StateNet1.py                 Phase 2: SolutionNet, ChemNet, StateNet
+      StateNet2.py                 Phase 3: StateNet2 (current model)
+      train_StateNet2.py           Phase 3: data gen, training, evaluation
+      lossfn.py                    Phase 3: all loss functions
+      IDTNet.py                    Standalone IDT predictor (exploratory)
+      ct_runs.py                   Cantera run + plotting helpers
+  results/
+    statenet.pt                    Saved StateNet1 weights
+    statenet2.pt                   Saved StateNet2 weights (full mechanism)
+    training_loss.png              StateNet1 loss curve
+    training_loss_lr1e-04.png      StateNet2 loss curve
+    validate_hk.png                Enthalpy validation plot
+    validate_sk.png                Entropy validation plot
+    validate_kf.png                Rate constant validation plot
+    states_*.csv                   Cantera trajectory data (full mechanism)
+    26/
+      states_*.csv                 Cantera trajectory data (26-species)
+    eval/
+      rollout_*.png                Per-condition rollout comparison plots
+      eval_summary.csv             Tabulated evaluation metrics
+
+
+================================================================================
+  9.  KEY DESIGN DECISIONS & NOTES
+================================================================================
+
+1. Residual architecture: StateNet1 uses state0 + MLP(state0), meaning
+   the network only needs to learn the delta. StateNet2 instead uses
+   full normalize -> MLP -> denormalize without an explicit skip
+   connection in physical space.
+
+2. Log-space species: Working in ln(X) space for normalization handles
+   the many-orders-of-magnitude range of trace species mole fractions.
+   The denormalize step applies exp() and clamps to 1e-10.
+
+3. Oracle t_end: The model receives t_end (= 5 * IDT) as an input, giving
+   it a sense of the reaction time scale. This is practical for
+   evaluation with known conditions but would need an IDTNet-style
+   predictor for blind deployment.
+
+4. Separate data vs physics losses: The data loss operates in normalized
+   space (comparing normalized outputs), while the physics losses
+   (enthalpy, atoms, mole fractions) operate in physical space after
+   denormalization. The ODE loss uses autograd through the full
+   normalize-net-denormalize chain.
+
+5. Loss weighting: The five loss terms span many orders of magnitude and
+   are manually weighted (1e-8 to 1e5). The current weights heavily
+   favor atom conservation and data fidelity, with the ODE residual
+   contributing much less. This is an active tuning area.
+
+6. Numerical stability: log(A) values for Arrhenius pre-exponential
+   factors are precomputed to avoid repeated log/exp of very large
+   numbers. Concentrations and pressures are clamped before log().
+   Equilibrium constants K_c are clamped to 1e-100 to avoid division
+   by zero in k_r computation.
