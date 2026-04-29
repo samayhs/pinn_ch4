@@ -55,7 +55,7 @@ def get_input_data_from_states(states: ct.SolutionArray, IDT: float, save_csv=Fa
 '''
 Model Training Helper Functions
 '''
-def generate_training_data(gas, P_list=None, T_list=None, phi_list= None, rerun=False):
+def generate_training_data(gas, P_list=None, T_list=None, phi_list= None, rerun=False, state_root='results/'):
     """
     Sample random initial conditions as state vectors [T, P, X_1...Y_K, dt].
     Loads from CSV if available, otherwise runs Cantera and saves.
@@ -73,7 +73,8 @@ def generate_training_data(gas, P_list=None, T_list=None, phi_list= None, rerun=
     # For each outlineed condition
     for T, P, phi in product(T_list, P_list, phi_list):
         # This is what the output file should look like
-        state_path = f"results/26/states_T={T}K, P={P}atm, phi={phi}.csv"
+
+        state_path = os.path.join(state_root,f"states_T={T}K, P={P}atm, phi={phi}.csv")
 
         # Do not rerun ct sims if data on them already exists or explicitly told to
         if os.path.exists(state_path) and not rerun:

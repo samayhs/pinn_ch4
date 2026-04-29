@@ -30,6 +30,15 @@ def dt_finder(csv_path):
         print(t_new-t1)
         t1 = t_new
         
+def inactive_species_index(full_data, eps=1e-10):
+    lst = []
+    for traj in full_data:
+        counts = (traj > eps).sum(dim=0)
+        lst.append(counts)
+    return lst
+
+
+
 
 def plot_csv(csv_paths):
     
